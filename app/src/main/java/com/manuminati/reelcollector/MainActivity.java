@@ -38,14 +38,15 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Reel Collector v4: only saves real Instagram Reel links.
+ * Reel Collector v5: only saves real Instagram Reel links.
  * Automatic Share -> Copy link uses visible web controls, not private APIs.
  * Instagram may reject scripted / synthetic interaction. If so, manually
  * tapping Share -> Copy link while the app is open still collects via clipboard.
  */
 public class MainActivity extends Activity {
     private static final int EXPORT_REQUEST = 42;
-    private static final long INTERVAL = 3000L;
+    private static final long AFTER_CLOSE_DELAY = 1000L;
+    private static final long AFTER_SWIPE_DELAY = 650L;
     private static final Pattern REEL_LINK = Pattern.compile(
         "https?://(?:(?:www|m)\\.)?instagram\\.com/(reel|share/reel)/([A-Za-z0-9_-]+)",
         Pattern.CASE_INSENSITIVE);
@@ -64,6 +65,7 @@ public class MainActivity extends Activity {
     private boolean autoScroll = false;
     private boolean probePending = false;
     private boolean shareBusy = false;
+    private int cycleToken = 0;
     private boolean sharePending = false;
     private String detectStatus = "waiting";
     private String shareStatus = "ready";
@@ -79,20 +81,31 @@ public class MainActivity extends Activity {
         }
     };
 
-    /** Each cycle tries to save current Reel BEFORE swiping to the next one. */
+    /** Single sequential cycle; never overlap two Share sheets. */
     private final Runnable autoCycle = new Runnable() {
         @Override public void run() {
-            if (!autoScroll || !foreground || listVisible) return;
+            if (!autoScroll || !foreground || listVisible || shareBusy) return;
             collect(browser.getUrl());
             probeVisibleReel();
-            attemptShareCopy();
-            // Only advance after giving the Share/Copy sheet a chance to close.
-            handler.postDelayed(() -> {
-                if (autoScroll && foreground && !listVisible && !shareBusy) swipeUpSlowly();
-            }, 2250);
-            handler.postDelayed(this, INTERVAL);
+            attemptShareCopy(true);
         }
     };
+
+    private void scheduleNextCycle(int token) {
+        if (token != cycleToken || !autoScroll || !foreground || listVisible) return;
+        handler.postDelayed(() -> {
+            if (token == cycleToken && autoScroll && foreground && !listVisible) {
+                shareStatus = "scrolling to next Reel";
+                updateStatus();
+                swipeUpSlowly();
+                handler.postDelayed(() -> {
+                    if (token == cycleToken && autoScroll && foreground && !listVisible) {
+                        handler.post(autoCycle);
+                    }
+                }, AFTER_SWIPE_DELAY);
+            }
+        }, AFTER_CLOSE_DELAY);
+    }
 
     @Override public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -118,12 +131,12 @@ public class MainActivity extends Activity {
         button(first, "Reels", () -> { showBrowser(); browser.loadUrl("https://www.instagram.com/reels/"); });
         button(first, "Try Share + Copy", () -> {
             showBrowser();
-            attemptShareCopy();
+            attemptShareCopy(false);
         });
         button(first, "Saved", this::showList);
 
         LinearLayout second = horizontal(root);
-        autoButton = button(second, "Start Auto (3s)", this::toggleAuto);
+        autoButton = button(second, "Start Auto", this::toggleAuto);
         button(second, "Stop", this::stopAuto);
 
         LinearLayout third = horizontal(root);
@@ -202,24 +215,26 @@ public class MainActivity extends Activity {
     private void toast(String message) { Toast.makeText(this, message, Toast.LENGTH_SHORT).show(); }
     private void updateStatus() {
         if (status != null) status.setText("Saved: " + links.size() +
-            " | Auto: " + (autoScroll ? "ON / 3 seconds" : "OFF") +
+            " | Auto: " + (autoScroll ? "ON / sequential" : "OFF") +
             "\nDetect: " + detectStatus + " | Share: " + shareStatus);
     }
 
     private void toggleAuto() {
         if (autoScroll) { stopAuto(); return; }
         showBrowser();
+        cycleToken++;
         autoScroll = true;
         autoButton.setText("Pause Auto Scroll");
         updateStatus();
         handler.removeCallbacks(autoCycle);
         handler.post(autoCycle);
-        toast("Auto-scroll: every 3 seconds. Trying Share -> Copy link.");
+        toast("Auto: Share, Copy, Back, wait 1s, Scroll, repeat.");
     }
     private void stopAuto() {
         autoScroll = false;
+        cycleToken++;
         handler.removeCallbacks(autoCycle);
-        if (autoButton != null) autoButton.setText("Start Auto (3s)");
+        if (autoButton != null) autoButton.setText("Start Auto");
         updateStatus();
     }
 
@@ -329,46 +344,114 @@ public class MainActivity extends Activity {
         return new JSONObject(String.valueOf(unwrapped));
     }
 
-    private void attemptShareCopy() {
+    // Instagram can implement a Share sheet either as HTML or as a native dialog.
+    // We dismiss the HTML sheet first. We do not call WebView.goBack() blindly,
+    // because that can navigate away from Reels instead of closing the sheet.
+    private static final String DISMISS_SHARE = """
+        (function(){
+          try {
+            const dialog=document.querySelector('[role="dialog"],dialog[open]');
+            if(!dialog)return JSON.stringify({open:false,closed:true});
+            const buttons=dialog.querySelectorAll('button,[role="button"],[aria-label]');
+            for(const el of buttons){
+              const label=(el.getAttribute('aria-label')||el.textContent||'').trim();
+              if(/^(close|dismiss|back|cancel|done|x)$/i.test(label)){
+                el.click();return JSON.stringify({open:true,closed:true});
+              }
+            }
+            const backdrop=document.elementFromPoint(8,Math.floor(innerHeight/2));
+            if(backdrop && !dialog.contains(backdrop)){
+              backdrop.click();return JSON.stringify({open:true,closed:true});
+            }
+            return JSON.stringify({open:true,closed:false});
+          }catch(e){return JSON.stringify({open:true,closed:false});}
+        })();
+        """;
+
+    private void closeShareThenContinue(int token, boolean automatic) {
+        shareStatus = "closing Share";
+        updateStatus();
+        browser.evaluateJavascript(DISMISS_SHARE, raw -> {
+            boolean closed = false;
+            try { closed = decodeJavascriptObject(raw).optBoolean("closed", false); }
+            catch (Exception ignored) { }
+            if (!closed) {
+                // Escape is safe compared with navigating the browser history.
+                long now = SystemClock.uptimeMillis();
+                browser.dispatchKeyEvent(new android.view.KeyEvent(now, now,
+                    android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_ESCAPE, 0));
+                browser.dispatchKeyEvent(new android.view.KeyEvent(now, now + 1,
+                    android.view.KeyEvent.ACTION_UP, android.view.KeyEvent.KEYCODE_ESCAPE, 0));
+            }
+            handler.postDelayed(() -> {
+                if (token != cycleToken && automatic) return;
+                browser.evaluateJavascript("(function(){return !!document.querySelector('[role=\"dialog\"],dialog[open]')})()", open -> {
+                    if ("true".equals(open)) {
+                        shareStatus = "Share still open: close manually";
+                        shareBusy = false;
+                        sharePending = false;
+                        if (automatic) stopAuto();
+                        updateStatus();
+                        return;
+                    }
+                    shareStatus = "Share closed; waiting 1s";
+                    shareBusy = false;
+                    sharePending = false;
+                    updateStatus();
+                    if (automatic) scheduleNextCycle(token);
+                });
+            }, 300);
+        });
+    }
+
+    private void attemptShareCopy(boolean automatic) {
         if (browser == null || !foreground || listVisible || shareBusy) return;
+        final int token = cycleToken;
         shareBusy = true;
         sharePending = true;
         clipboardBeforeAttempt = clipboardText();
         shareStatus = "finding Share";
         updateStatus();
         tapWebElement(FIND_SHARE, didTapShare -> {
+            if (automatic && token != cycleToken) return;
             if (!didTapShare) {
                 shareBusy = false;
                 sharePending = false;
                 shareStatus = "Share button unavailable";
+                if (automatic) stopAuto();
                 updateStatus();
                 return;
             }
             shareStatus = "Share tapped";
             updateStatus();
             handler.postDelayed(() -> tapWebElement(FIND_COPY, didTapCopy -> {
+                if (automatic && token != cycleToken) return;
                 if (!didTapCopy) {
                     shareBusy = false;
                     shareStatus = "Tap Copy link manually";
+                    if (automatic) stopAuto();
                     updateStatus();
-                    // Do not swipe behind an unknown share dialog and silently lose Reels.
-                    if (autoScroll) {
-                        stopAuto();
-                        toast("Share opened. Tap Copy link, then resume auto-scroll.");
-                    }
+                    toast("Copy link not found; tap it manually, then close Share.");
                     return;
                 }
                 shareStatus = "Copy link tapped";
                 updateStatus();
                 handler.postDelayed(() -> {
+                    if (automatic && token != cycleToken) return;
                     String current = clipboardText();
                     if (!current.isEmpty() && !current.equals(clipboardBeforeAttempt)) collect(current);
-                    if (shareStatus.equals("Copy link tapped")) shareStatus = "Clipboard checked";
-                    shareBusy = false;
-                    sharePending = false;
-                    updateStatus();
-                }, 470);
-            }), 620);
+                    // The clipboard may be unavailable, or Instagram may have blocked copying.
+                    // Never advance automatically unless we have a valid Reel permalink.
+                    if (current.isEmpty() || !REEL_LINK.matcher(current).find()) {
+                        shareStatus = "No copied URL; check Share manually";
+                        shareBusy = false;
+                        if (automatic) stopAuto();
+                        updateStatus();
+                        return;
+                    }
+                    closeShareThenContinue(token, automatic);
+                }, 550);
+            }), 850);
         });
     }
 
