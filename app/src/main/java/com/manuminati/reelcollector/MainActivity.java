@@ -22,6 +22,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 import java.io.OutputStream;
+import org.json.JSONObject;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -42,6 +43,8 @@ public class MainActivity extends Activity {
     private boolean listVisible = false;
     private boolean autoScroll = false;
     private boolean foreground = true;
+    private String detection = "waiting";
+    private boolean domProbeRunning = false;
     private Button autoButton;
     private static final long SCROLL_INTERVAL_MS = 3000L;
     // This is a best-effort touch swipe on the embedded WebView, not an Instagram API.
@@ -50,12 +53,16 @@ public class MainActivity extends Activity {
             if (!autoScroll || !foreground || browser == null || listVisible) return;
             swipeUpSlowly();
             collect(browser.getUrl());
+            probeVisibleReel();
             handler.postDelayed(this, SCROLL_INTERVAL_MS);
         }
     };
     private final Runnable watcher = new Runnable() {
         @Override public void run() {
-            if (browser != null) collect(browser.getUrl());
+            if (browser != null && foreground && !listVisible) {
+                collect(browser.getUrl());
+                probeVisibleReel();
+            }
             handler.postDelayed(this, 1200);
         }
     };
@@ -82,7 +89,8 @@ public class MainActivity extends Activity {
             if (browser != null) {
                 int before = links.size();
                 collect(browser.getUrl());
-                Toast.makeText(this, links.size() > before ? "Reel saved" : "No new Reel URL detected", Toast.LENGTH_SHORT).show();
+                probeVisibleReel();
+                Toast.makeText(this, links.size() > before ? "Reel saved" : "Checking visible Reel link...", Toast.LENGTH_SHORT).show();
             }
         });
         addButton(row, "Saved", this::showList);
@@ -126,10 +134,12 @@ public class MainActivity extends Activity {
             @Override public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
                 super.doUpdateVisitedHistory(view, url, isReload);
                 collect(url);
+                probeVisibleReel();
             }
             @Override public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 collect(url);
+                probeVisibleReel();
             }
         });
         root.addView(browser, new LinearLayout.LayoutParams(-1, 0, 1));
@@ -159,7 +169,7 @@ public class MainActivity extends Activity {
     }
     private void updateCount() {
         if (status != null) status.setText("Saved: " + links.size() + " | Auto-scroll: "
-            + (autoScroll ? "ON (every 3s)" : "OFF") + " | URLs: best effort");
+            + (autoScroll ? "ON (every 3s)" : "OFF") + " | Detect: " + detection);
     }
     private void toggleAutoScroll() {
         if (autoScroll) { stopAutoScroll(); return; }
@@ -194,7 +204,7 @@ public class MainActivity extends Activity {
                 int action = index == steps ? MotionEvent.ACTION_UP : MotionEvent.ACTION_MOVE;
                 dispatchSwipeEvent(action, x, y, downAt, SystemClock.uptimeMillis());
                 if (index == steps) handler.postDelayed(() -> {
-                    if (browser != null) collect(browser.getUrl());
+                    if (browser != null) { collect(browser.getUrl()); probeVisibleReel(); }
                 }, 500);
             }, i * 35L);
         }
@@ -203,6 +213,88 @@ public class MainActivity extends Activity {
         MotionEvent event = MotionEvent.obtain(downTime, eventTime, action, x, y, 0);
         try { browser.dispatchTouchEvent(event); } finally { event.recycle(); }
     }
+
+    // Find ONLY the Reel currently visible on screen, not every link in the feed.
+    // Instagram frequently changes video without changing WebView.getUrl().
+    // This runs in the page's own DOM; no private Instagram API or password access.
+    private void probeVisibleReel() {
+        if (browser == null || !foreground || listVisible || domProbeRunning) return;
+        domProbeRunning = true;
+        final String js = """
+            (function() {
+              try {
+                const rx = /\\/reel\\/[A-Za-z0-9_-]+/;
+                const vw = innerWidth, vh = innerHeight;
+                function clean(h) {
+                  if (!h) return null;
+                  try {
+                    const u = new URL(h, location.href);
+                    if (!/(^|\\.)instagram\\.com$/i.test(u.hostname)) return null;
+                    const m = u.pathname.match(/^\\/reel\\/([A-Za-z0-9_-]+)/i);
+                    return m ? 'https://www.instagram.com/reel/' + m[1] + '/' : null;
+                  } catch(e) { return null; }
+                }
+                function visible(el) {
+                  const r = el.getBoundingClientRect();
+                  if (r.width < 1 || r.height < 1) return null;
+                  const x = Math.max(0, Math.min(r.right,vw)-Math.max(r.left,0));
+                  const y = Math.max(0, Math.min(r.bottom,vh)-Math.max(r.top,0));
+                  if (x*y < 20) return null;
+                  return { r, area:x*y };
+                }
+                // When the browser URL actually points to a reel, it is the strongest signal.
+                const loc = clean(location.href);
+                if (loc) return JSON.stringify({url:loc,method:'page-url'});
+                // Detect the currently playing/central video and its own enclosing permalink.
+                const vids = Array.from(document.querySelectorAll('video'))
+                  .map(v => ({v, pos:visible(v)})).filter(o => o.pos)
+                  .sort((a,b) => ((b.v.paused ? 0 : 10000000)+b.pos.area) -
+                                 ((a.v.paused ? 0 : 10000000)+a.pos.area));
+                for (const {v} of vids) {
+                  let node = v;
+                  for (let depth=0; node && depth<9; depth++,node=node.parentElement) {
+                    if (node.matches && node.matches('a[href]')) {
+                      const u=clean(node.href); if(u) return JSON.stringify({url:u,method:'video-anchor'});
+                    }
+                    if (node.querySelectorAll) {
+                      const found = Array.from(node.querySelectorAll('a[href*="/reel/"]'))
+                        .map(a=>clean(a.href)).filter(Boolean);
+                      const unique=Array.from(new Set(found));
+                      if (unique.length===1) return JSON.stringify({url:unique[0],method:'video-container'});
+                    }
+                  }
+                }
+                // Fallback: pick the most central, visible reel permalink.
+                const candidates = Array.from(document.querySelectorAll('a[href*="/reel/"]'))
+                  .map(a=>({u:clean(a.href),p:visible(a)}))
+                  .filter(o=>o.u && o.p)
+                  .map(o=>({u:o.u,score: o.p.area /
+                    (1+Math.abs((o.p.r.top+o.p.r.bottom)/2-vh/2)/vh)}))
+                  .sort((a,b)=>b.score-a.score);
+                // Multiple different reel links visible is ambiguous: do not save a wrong one.
+                if (candidates.length && (candidates.length===1 ||
+                     candidates[0].score > candidates[1].score * 2))
+                  return JSON.stringify({url:candidates[0].u,method:'visible-link'});
+                return JSON.stringify({url:null,method:vids.length ? 'no-permalink' : 'no-video'});
+              } catch(e) { return JSON.stringify({url:null,method:'js-error'}); }
+            })();
+            """;
+        browser.evaluateJavascript(js, result -> {
+            domProbeRunning = false;
+            if (result == null) return;
+            try {
+                // evaluateJavascript wraps the returned JSON string in another JSON string.
+                Object decoded = new org.json.JSONTokener(result).nextValue();
+                JSONObject obj = new JSONObject(String.valueOf(decoded));
+                String url = obj.optString("url", "");
+                String method = obj.optString("method", "unknown");
+                if (!url.isEmpty() && !"null".equals(url)) collect(url);
+                detection = method;
+                updateCount();
+            } catch(Exception ignored) { detection = "parse-error"; updateCount(); }
+        });
+    }
+
     private void collect(String url) {
         if (url == null) return;
         Matcher m = REEL_PATTERN.matcher(url);

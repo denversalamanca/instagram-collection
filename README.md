@@ -1,18 +1,20 @@
-# Instagram Reel Link Collector v2 — Auto Scroll
+# Instagram Reel Collector v3 — visible Reel URL detection
 
-Android Java WebView project (minimum Android 6, API 23, including Redmi 9A on Android 10).
+Fixes **Saved: 0** caused by `WebView.getUrl()` staying unchanged while Instagram reels advance.
 
-## Features
-- Instagram mobile website inside the app.
-- Start/Pause auto swipe every **3 seconds**, gesture duration ~420ms.
-- Auto scrolling happens only while app is open and WebView is visible. Stops on pause/background or Saved view.
-- Detects *main-frame navigations* to Instagram `/reel/SHORTCODE/` URL, deduplicates and persists locally.
-- **Important limitation:** Instagram can show different Reels without changing WebView main URL. Those Reels **will not be captured** by this implementation. Auto-scrolling is not equivalent to reliable harvesting of Reel links. Embedded site login and swipe behavior also depend on Instagram's WebView support and site changes. Do not treat 3-second intervals as a guarantee of platform compliance or no rate limiting.
-- Save URL, Copy All, export TXT using Android document picker. No video download.
-- No background service, no Instagram password interception, no accessibility permissions.
+## How it works
+- Auto swipe every 3 seconds while open.
+- Every ~1.2s, JavaScript checks the **visible Reel**, looking for its permalink via the current page URL, enclosing video link, unique link in the video's container, or one clearly dominant on-screen reel link.
+- Saves **only a reasonably identifiable current Reel** to local private preferences, avoiding duplicates.
+- `Detect:` in header reports `page-url`, `video-anchor`, `video-container`, `visible-link`, `no-permalink`, `no-video` or error.
+- Copy All or Export TXT via Android file picker.
+- `Save URL` also attempts to detect current visible Reel.
+- Compatible with Android 6+ (Redmi 9A typically uses Android 10), with an up-to-date Android System WebView.
 
-## GitHub Actions
-Upload the **contents** of this ZIP into the repository root (including `.github/workflows/build-apk.yml`) and commit on `main`. Actions > Build Android APK > choose latest run; on success download `InstagramReelCollector-AutoScroll-APK` from Artifacts. Unzip artifact, install `app-debug.apk` on Android. Build is not verified here because Android build tools are not installed in this environment.
+## Limitations
+**Not guaranteed to collect every Reel.** Instagram can render Reel content without exposing a unique permalink in the DOM. In that case the app shows `no-permalink` and skips it rather than inventing a URL or collecting unrelated offscreen suggestions. Instagram may also block or change embedded WebView behavior. If needed use Instagram Share > Copy link (and Save URL cannot recover an absent link). No Instagram private API or login interception. 3-second scrolling does not avoid platform rate limits or rules.
 
-## Requirements
-Android Studio/Gradle plugin 8.7.3, Gradle 8.9, JDK 17, Android SDK 35. Redmi 9A Android 10 meets `minSdk 23`; free memory/WebView version and Instagram site compatibility can still affect results.
+## Build APK using GitHub Actions
+Upload **the contents** of this zip (including `.github/workflows/build-apk.yml`) into repo root. Commit, Actions > Build Android APK > latest successful run > Artifacts > `InstagramReelCollector-v3-APK`, unzip and install `app-debug.apk`.
+
+GitHub Actions uses JDK 17 and Gradle 8.9 for Android Gradle Plugin 8.7.3. Not compiled or device-tested here.
