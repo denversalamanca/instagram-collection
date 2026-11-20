@@ -17,6 +17,9 @@ import android.webkit.CookieManager;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.webkit.RenderProcessGoneDetail;
+import android.view.ViewGroup;
+import android.os.Build;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -38,15 +41,19 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Reel Collector v5: only saves real Instagram Reel links.
+ * Reel Collector v6: only saves real Instagram Reel links.
  * Automatic Share -> Copy link uses visible web controls, not private APIs.
  * Instagram may reject scripted / synthetic interaction. If so, manually
  * tapping Share -> Copy link while the app is open still collects via clipboard.
  */
 public class MainActivity extends Activity {
     private static final int EXPORT_REQUEST = 42;
-    private static final long AFTER_CLOSE_DELAY = 1000L;
-    private static final long AFTER_SWIPE_DELAY = 650L;
+    // Explicit pacing: Share -> 1s -> Copy -> 1s -> Back -> 2s -> Swipe -> 2s -> Share.
+    private static final long AFTER_SHARE_DELAY = 1000L;
+    private static final long AFTER_COPY_DELAY = 1000L;
+    private static final long AFTER_CLOSE_DELAY = 2000L;
+    private static final long AFTER_SWIPE_DELAY = 2000L;
+    private static final long DISMISS_VERIFY_DELAY = 1000L;
     private static final Pattern REEL_LINK = Pattern.compile(
         "https?://(?:(?:www|m)\\.)?instagram\\.com/(reel|share/reel)/([A-Za-z0-9_-]+)",
         Pattern.CASE_INSENSITIVE);
@@ -73,11 +80,12 @@ public class MainActivity extends Activity {
 
     private final Runnable periodicProbe = new Runnable() {
         @Override public void run() {
-            if (foreground && browser != null && !listVisible) {
+            // Avoid DOM scans during the heavy Share/Copy/Swipe automation.
+            if (foreground && browser != null && !listVisible && !autoScroll && !shareBusy) {
                 collect(browser.getUrl());
                 probeVisibleReel();
             }
-            handler.postDelayed(this, 1200);
+            handler.postDelayed(this, 4000);
         }
     };
 
@@ -85,8 +93,8 @@ public class MainActivity extends Activity {
     private final Runnable autoCycle = new Runnable() {
         @Override public void run() {
             if (!autoScroll || !foreground || listVisible || shareBusy) return;
+            if (browser == null) { stopAuto(); return; }
             collect(browser.getUrl());
-            probeVisibleReel();
             attemptShareCopy(true);
         }
     };
@@ -158,6 +166,21 @@ public class MainActivity extends Activity {
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(browser, false);
         browser.setWebViewClient(new WebViewClient() {
+            @Override public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                // Android 8+: a low-memory WebView renderer can die independently.
+                // Remove the dead instance and recreate the Activity instead of crashing.
+                stopAuto();
+                shareBusy = false;
+                probePending = false;
+                shareStatus = "WebView restarted after renderer stopped";
+                updateStatus();
+                ViewGroup parent = (ViewGroup) view.getParent();
+                if (parent != null) parent.removeView(view);
+                if (browser == view) browser = null;
+                view.destroy();
+                handler.post(() -> { if (!isFinishing() && !isDestroyed()) recreate(); });
+                return true;
+            }
             @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 if (!request.isForMainFrame()) return false;
                 Uri uri = request.getUrl();
@@ -193,7 +216,7 @@ public class MainActivity extends Activity {
         renderList();
         updateStatus();
         browser.loadUrl("https://www.instagram.com/reels/");
-        handler.postDelayed(periodicProbe, 1200);
+        handler.postDelayed(periodicProbe, 4000);
         receiveSharedText(getIntent());
     }
 
@@ -228,12 +251,14 @@ public class MainActivity extends Activity {
         updateStatus();
         handler.removeCallbacks(autoCycle);
         handler.post(autoCycle);
-        toast("Auto: Share, Copy, Back, wait 1s, Scroll, repeat.");
+        toast("Auto: Share > 1s > Copy > 1s > Back > 2s > Swipe > 2s.");
     }
     private void stopAuto() {
         autoScroll = false;
         cycleToken++;
         handler.removeCallbacks(autoCycle);
+        shareBusy = false;
+        sharePending = false;
         if (autoButton != null) autoButton.setText("Start Auto");
         updateStatus();
     }
@@ -330,7 +355,9 @@ public class MainActivity extends Activity {
     private interface TapResult { void onResult(boolean success); }
     private void tapWebElement(String js, TapResult callback) {
         if (browser == null || listVisible || !foreground) { callback.onResult(false); return; }
-        browser.evaluateJavascript(js, raw -> {
+        final WebView active = browser;
+        active.evaluateJavascript(js, raw -> {
+            if (browser != active || !foreground) { callback.onResult(false); return; }
             try {
                 JSONObject obj = decodeJavascriptObject(raw);
                 if (!obj.optBoolean("found", false)) { callback.onResult(false); return; }
@@ -371,12 +398,14 @@ public class MainActivity extends Activity {
     private void closeShareThenContinue(int token, boolean automatic) {
         shareStatus = "closing Share";
         updateStatus();
+        if (browser == null || !foreground) { if (automatic) stopAuto(); return; }
         browser.evaluateJavascript(DISMISS_SHARE, raw -> {
             boolean closed = false;
             try { closed = decodeJavascriptObject(raw).optBoolean("closed", false); }
             catch (Exception ignored) { }
             if (!closed) {
-                // Escape is safe compared with navigating the browser history.
+                // Escape can dismiss some web overlays without navigating away.
+                if (browser == null) { if (automatic) stopAuto(); return; }
                 long now = SystemClock.uptimeMillis();
                 browser.dispatchKeyEvent(new android.view.KeyEvent(now, now,
                     android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_ESCAPE, 0));
@@ -384,7 +413,8 @@ public class MainActivity extends Activity {
                     android.view.KeyEvent.ACTION_UP, android.view.KeyEvent.KEYCODE_ESCAPE, 0));
             }
             handler.postDelayed(() -> {
-                if (token != cycleToken && automatic) return;
+                if (automatic && (token != cycleToken || !autoScroll)) return;
+                if (browser == null || !foreground) return;
                 browser.evaluateJavascript("(function(){return !!document.querySelector('[role=\"dialog\"],dialog[open]')})()", open -> {
                     if ("true".equals(open)) {
                         shareStatus = "Share still open: close manually";
@@ -394,13 +424,13 @@ public class MainActivity extends Activity {
                         updateStatus();
                         return;
                     }
-                    shareStatus = "Share closed; waiting 1s";
+                    shareStatus = "Share closed; waiting 2s";
                     shareBusy = false;
                     sharePending = false;
                     updateStatus();
                     if (automatic) scheduleNextCycle(token);
                 });
-            }, 300);
+            }, DISMISS_VERIFY_DELAY);
         });
     }
 
@@ -450,8 +480,8 @@ public class MainActivity extends Activity {
                         return;
                     }
                     closeShareThenContinue(token, automatic);
-                }, 550);
-            }), 850);
+                }, AFTER_COPY_DELAY);
+            }), AFTER_SHARE_DELAY);
         });
     }
 
@@ -656,6 +686,7 @@ public class MainActivity extends Activity {
         handler.removeCallbacks(periodicProbe);
         handler.removeCallbacks(autoCycle);
         if (clipboard != null && clipListener != null) clipboard.removePrimaryClipChangedListener(clipListener);
+        handler.removeCallbacksAndMessages(null);
         if (browser != null) browser.destroy();
         super.onDestroy();
     }
