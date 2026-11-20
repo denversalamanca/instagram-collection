@@ -1,6 +1,7 @@
 package com.manuminati.reelcollector;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
@@ -21,45 +22,56 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
-import java.io.OutputStream;
+
 import org.json.JSONObject;
+import org.json.JSONTokener;
+
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+/**
+ * Reel Collector v4: only saves real Instagram Reel links.
+ * Automatic Share -> Copy link uses visible web controls, not private APIs.
+ * Instagram may reject scripted / synthetic interaction. If so, manually
+ * tapping Share -> Copy link while the app is open still collects via clipboard.
+ */
 public class MainActivity extends Activity {
     private static final int EXPORT_REQUEST = 42;
-    private static final Pattern REEL_PATTERN = Pattern.compile("https?://(?:www\\.)?instagram\\.com/reel/([A-Za-z0-9_-]+)", Pattern.CASE_INSENSITIVE);
+    private static final long INTERVAL = 3000L;
+    private static final Pattern REEL_LINK = Pattern.compile(
+        "https?://(?:(?:www|m)\\.)?instagram\\.com/(reel|share/reel)/([A-Za-z0-9_-]+)",
+        Pattern.CASE_INSENSITIVE);
+
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Set<String> links = new HashSet<>();
     private WebView browser;
     private TextView status;
     private LinearLayout savedList;
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private final Set<String> links = new HashSet<>();
+    private ScrollView listScroll;
+    private Button autoButton;
+    private ClipboardManager clipboard;
+    private ClipboardManager.OnPrimaryClipChangedListener clipListener;
+    private boolean foreground = true;
     private boolean listVisible = false;
     private boolean autoScroll = false;
-    private boolean foreground = true;
-    private String detection = "waiting";
-    private boolean domProbeRunning = false;
-    private Button autoButton;
-    private static final long SCROLL_INTERVAL_MS = 3000L;
-    // This is a best-effort touch swipe on the embedded WebView, not an Instagram API.
-    private final Runnable scrollTask = new Runnable() {
+    private boolean probePending = false;
+    private boolean shareBusy = false;
+    private boolean sharePending = false;
+    private String detectStatus = "waiting";
+    private String shareStatus = "ready";
+    private String clipboardBeforeAttempt = "";
+
+    private final Runnable periodicProbe = new Runnable() {
         @Override public void run() {
-            if (!autoScroll || !foreground || browser == null || listVisible) return;
-            swipeUpSlowly();
-            collect(browser.getUrl());
-            probeVisibleReel();
-            handler.postDelayed(this, SCROLL_INTERVAL_MS);
-        }
-    };
-    private final Runnable watcher = new Runnable() {
-        @Override public void run() {
-            if (browser != null && foreground && !listVisible) {
+            if (foreground && browser != null && !listVisible) {
                 collect(browser.getUrl());
                 probeVisibleReel();
             }
@@ -67,52 +79,66 @@ public class MainActivity extends Activity {
         }
     };
 
-    @Override public void onCreate(Bundle state) {
-        super.onCreate(state);
+    /** Each cycle tries to save current Reel BEFORE swiping to the next one. */
+    private final Runnable autoCycle = new Runnable() {
+        @Override public void run() {
+            if (!autoScroll || !foreground || listVisible) return;
+            collect(browser.getUrl());
+            probeVisibleReel();
+            attemptShareCopy();
+            // Only advance after giving the Share/Copy sheet a chance to close.
+            handler.postDelayed(() -> {
+                if (autoScroll && foreground && !listVisible && !shareBusy) swipeUpSlowly();
+            }, 2250);
+            handler.postDelayed(this, INTERVAL);
+        }
+    };
+
+    @Override public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
         links.addAll(getPreferences(MODE_PRIVATE).getStringSet("reels", Collections.emptySet()));
+        clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        clipListener = () -> {
+            if (foreground) handler.post(this::captureClipboard);
+        };
+        if (clipboard != null) clipboard.addPrimaryClipChangedListener(clipListener);
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.WHITE);
         setContentView(root);
 
         status = new TextView(this);
-        status.setTextSize(15);
-        status.setPadding(16, 12, 16, 12);
+        status.setTextSize(14f);
+        status.setTextColor(Color.DKGRAY);
+        status.setPadding(14, 10, 14, 10);
         root.addView(status);
-        updateCount();
 
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        root.addView(row);
-        addButton(row, "Reels", () -> { showBrowser(); browser.loadUrl("https://www.instagram.com/reels/"); });
-        addButton(row, "Save URL", () -> {
-            if (browser != null) {
-                int before = links.size();
-                collect(browser.getUrl());
-                probeVisibleReel();
-                Toast.makeText(this, links.size() > before ? "Reel saved" : "Checking visible Reel link...", Toast.LENGTH_SHORT).show();
-            }
+        LinearLayout first = horizontal(root);
+        button(first, "Reels", () -> { showBrowser(); browser.loadUrl("https://www.instagram.com/reels/"); });
+        button(first, "Try Share + Copy", () -> {
+            showBrowser();
+            attemptShareCopy();
         });
-        addButton(row, "Saved", this::showList);
+        button(first, "Saved", this::showList);
 
-        LinearLayout autoRow = new LinearLayout(this);
-        autoRow.setOrientation(LinearLayout.HORIZONTAL);
-        root.addView(autoRow);
-        autoButton = addButton(autoRow, "Start Auto Scroll (3s)", this::toggleAutoScroll);
-        addButton(autoRow, "Stop", this::stopAutoScroll);
+        LinearLayout second = horizontal(root);
+        autoButton = button(second, "Start Auto (3s)", this::toggleAuto);
+        button(second, "Stop", this::stopAuto);
 
-        LinearLayout row2 = new LinearLayout(this);
-        row2.setOrientation(LinearLayout.HORIZONTAL);
-        root.addView(row2);
-        addButton(row2, "Copy All", this::copyAll);
-        addButton(row2, "Export TXT", this::exportTxt);
-        addButton(row2, "Clear", () -> new android.app.AlertDialog.Builder(this)
-            .setTitle("Delete all saved links?")
-            .setPositiveButton("Delete", (d, w) -> { links.clear(); persist(); renderList(); })
+        LinearLayout third = horizontal(root);
+        button(third, "Paste Link", this::pasteLink);
+        button(third, "Copy All", this::copyAll);
+        button(third, "Export TXT", this::exportTxt);
+        button(third, "Clear", () -> new AlertDialog.Builder(this)
+            .setTitle("Delete all saved Reel links?")
+            .setPositiveButton("Delete", (d, w) -> {
+                links.clear(); saveLinks(); renderList();
+            })
             .setNegativeButton("Cancel", null).show());
 
         browser = new WebView(this);
-        browser.getSettings().setJavaScriptEnabled(true); // Instagram's website needs JavaScript
+        browser.getSettings().setJavaScriptEnabled(true);
         browser.getSettings().setDomStorageEnabled(true);
         browser.getSettings().setMediaPlaybackRequiresUserGesture(false);
         browser.getSettings().setLoadWithOverviewMode(true);
@@ -120,15 +146,15 @@ public class MainActivity extends Activity {
         CookieManager.getInstance().setAcceptThirdPartyCookies(browser, false);
         browser.setWebViewClient(new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                Uri uri = request.getUrl();
                 if (!request.isForMainFrame()) return false;
-                String host = uri.getHost() == null ? "" : uri.getHost().toLowerCase(java.util.Locale.ROOT);
+                Uri uri = request.getUrl();
+                String host = uri.getHost() == null ? "" : uri.getHost().toLowerCase(Locale.ROOT);
                 if (host.equals("instagram.com") || host.endsWith(".instagram.com")) {
                     collect(uri.toString());
                     return false;
                 }
                 try { startActivity(new Intent(Intent.ACTION_VIEW, uri)); }
-                catch (Exception ignored) { Toast.makeText(MainActivity.this, "Can't open link", Toast.LENGTH_SHORT).show(); }
+                catch (Exception ignored) { toast("Could not open link"); }
                 return true;
             }
             @Override public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
@@ -144,254 +170,409 @@ public class MainActivity extends Activity {
         });
         root.addView(browser, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        ScrollView scroll = new ScrollView(this);
-        scroll.setVisibility(View.GONE);
+        listScroll = new ScrollView(this);
+        listScroll.setVisibility(View.GONE);
         savedList = new LinearLayout(this);
-        savedList.setPadding(16, 12, 16, 12);
         savedList.setOrientation(LinearLayout.VERTICAL);
-        scroll.addView(savedList);
-        root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
-        this.listScroll = scroll;
+        savedList.setPadding(16, 8, 16, 8);
+        listScroll.addView(savedList);
+        root.addView(listScroll, new LinearLayout.LayoutParams(-1, 0, 1));
         renderList();
+        updateStatus();
         browser.loadUrl("https://www.instagram.com/reels/");
-        handler.postDelayed(watcher, 1200);
-        handleSharedText(getIntent());
-    }
-    private ScrollView listScroll;
-    private Button addButton(LinearLayout row, String name, Runnable click) {
-        Button btn = new Button(this);
-        btn.setText(name);
-        btn.setTextSize(11);
-        btn.setAllCaps(false);
-        row.addView(btn, new LinearLayout.LayoutParams(0, -2, 1));
-        btn.setOnClickListener(v -> click.run());
-        return btn;
-    }
-    private void updateCount() {
-        if (status != null) status.setText("Saved: " + links.size() + " | Auto-scroll: "
-            + (autoScroll ? "ON (every 3s)" : "OFF") + " | Detect: " + detection);
-    }
-    private void toggleAutoScroll() {
-        if (autoScroll) { stopAutoScroll(); return; }
-        if (listVisible) showBrowser();
-        autoScroll = true;
-        autoButton.setText("Pause Auto Scroll");
-        updateCount();
-        handler.removeCallbacks(scrollTask);
-        handler.postDelayed(scrollTask, SCROLL_INTERVAL_MS);
-        Toast.makeText(this, "Auto scroll ON: 1 swipe every 3 seconds", Toast.LENGTH_SHORT).show();
-    }
-    private void stopAutoScroll() {
-        autoScroll = false;
-        handler.removeCallbacks(scrollTask);
-        if (autoButton != null) autoButton.setText("Start Auto Scroll (3s)");
-        updateCount();
-    }
-    private void swipeUpSlowly() {
-        if (browser.getWidth() < 1 || browser.getHeight() < 150 || !browser.isShown()) return;
-        // A gradual touch gesture (~450ms) in the WebView to advance the feed.
-        final float x = browser.getWidth() * 0.5f;
-        final float startY = browser.getHeight() * 0.80f;
-        final float endY = browser.getHeight() * 0.22f;
-        final long downAt = SystemClock.uptimeMillis();
-        dispatchSwipeEvent(MotionEvent.ACTION_DOWN, x, startY, downAt, downAt);
-        final int steps = 12;
-        for (int i = 1; i <= steps; i++) {
-            final int index = i;
-            handler.postDelayed(() -> {
-                if (!autoScroll || !foreground || listVisible || browser == null) return;
-                float y = startY + (endY - startY) * index / steps;
-                int action = index == steps ? MotionEvent.ACTION_UP : MotionEvent.ACTION_MOVE;
-                dispatchSwipeEvent(action, x, y, downAt, SystemClock.uptimeMillis());
-                if (index == steps) handler.postDelayed(() -> {
-                    if (browser != null) { collect(browser.getUrl()); probeVisibleReel(); }
-                }, 500);
-            }, i * 35L);
-        }
-    }
-    private void dispatchSwipeEvent(int action, float x, float y, long downTime, long eventTime) {
-        MotionEvent event = MotionEvent.obtain(downTime, eventTime, action, x, y, 0);
-        try { browser.dispatchTouchEvent(event); } finally { event.recycle(); }
+        handler.postDelayed(periodicProbe, 1200);
+        receiveSharedText(getIntent());
     }
 
-    // Find ONLY the Reel currently visible on screen, not every link in the feed.
-    // Instagram frequently changes video without changing WebView.getUrl().
-    // This runs in the page's own DOM; no private Instagram API or password access.
-    private void probeVisibleReel() {
-        if (browser == null || !foreground || listVisible || domProbeRunning) return;
-        domProbeRunning = true;
-        final String js = """
-            (function() {
-              try {
-                const rx = /\\/reel\\/[A-Za-z0-9_-]+/;
-                const vw = innerWidth, vh = innerHeight;
-                function clean(h) {
-                  if (!h) return null;
-                  try {
-                    const u = new URL(h, location.href);
-                    if (!/(^|\\.)instagram\\.com$/i.test(u.hostname)) return null;
-                    const m = u.pathname.match(/^\\/reel\\/([A-Za-z0-9_-]+)/i);
-                    return m ? 'https://www.instagram.com/reel/' + m[1] + '/' : null;
-                  } catch(e) { return null; }
-                }
-                function visible(el) {
-                  const r = el.getBoundingClientRect();
-                  if (r.width < 1 || r.height < 1) return null;
-                  const x = Math.max(0, Math.min(r.right,vw)-Math.max(r.left,0));
-                  const y = Math.max(0, Math.min(r.bottom,vh)-Math.max(r.top,0));
-                  if (x*y < 20) return null;
-                  return { r, area:x*y };
-                }
-                // When the browser URL actually points to a reel, it is the strongest signal.
-                const loc = clean(location.href);
-                if (loc) return JSON.stringify({url:loc,method:'page-url'});
-                // Detect the currently playing/central video and its own enclosing permalink.
-                const vids = Array.from(document.querySelectorAll('video'))
-                  .map(v => ({v, pos:visible(v)})).filter(o => o.pos)
-                  .sort((a,b) => ((b.v.paused ? 0 : 10000000)+b.pos.area) -
-                                 ((a.v.paused ? 0 : 10000000)+a.pos.area));
-                for (const {v} of vids) {
-                  let node = v;
-                  for (let depth=0; node && depth<9; depth++,node=node.parentElement) {
-                    if (node.matches && node.matches('a[href]')) {
-                      const u=clean(node.href); if(u) return JSON.stringify({url:u,method:'video-anchor'});
-                    }
-                    if (node.querySelectorAll) {
-                      const found = Array.from(node.querySelectorAll('a[href*="/reel/"]'))
-                        .map(a=>clean(a.href)).filter(Boolean);
-                      const unique=Array.from(new Set(found));
-                      if (unique.length===1) return JSON.stringify({url:unique[0],method:'video-container'});
-                    }
-                  }
-                }
-                // Fallback: pick the most central, visible reel permalink.
-                const candidates = Array.from(document.querySelectorAll('a[href*="/reel/"]'))
-                  .map(a=>({u:clean(a.href),p:visible(a)}))
-                  .filter(o=>o.u && o.p)
-                  .map(o=>({u:o.u,score: o.p.area /
-                    (1+Math.abs((o.p.r.top+o.p.r.bottom)/2-vh/2)/vh)}))
-                  .sort((a,b)=>b.score-a.score);
-                // Multiple different reel links visible is ambiguous: do not save a wrong one.
-                if (candidates.length && (candidates.length===1 ||
-                     candidates[0].score > candidates[1].score * 2))
-                  return JSON.stringify({url:candidates[0].u,method:'visible-link'});
-                return JSON.stringify({url:null,method:vids.length ? 'no-permalink' : 'no-video'});
-              } catch(e) { return JSON.stringify({url:null,method:'js-error'}); }
-            })();
-            """;
-        browser.evaluateJavascript(js, result -> {
-            domProbeRunning = false;
-            if (result == null) return;
+    private LinearLayout horizontal(LinearLayout root) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        root.addView(row);
+        return row;
+    }
+    private Button button(LinearLayout row, String title, Runnable callback) {
+        Button b = new Button(this);
+        b.setText(title);
+        b.setTextSize(11f);
+        b.setAllCaps(false);
+        row.addView(b, new LinearLayout.LayoutParams(0, -2, 1));
+        b.setOnClickListener(v -> callback.run());
+        return b;
+    }
+    private void toast(String message) { Toast.makeText(this, message, Toast.LENGTH_SHORT).show(); }
+    private void updateStatus() {
+        if (status != null) status.setText("Saved: " + links.size() +
+            " | Auto: " + (autoScroll ? "ON / 3 seconds" : "OFF") +
+            "\nDetect: " + detectStatus + " | Share: " + shareStatus);
+    }
+
+    private void toggleAuto() {
+        if (autoScroll) { stopAuto(); return; }
+        showBrowser();
+        autoScroll = true;
+        autoButton.setText("Pause Auto Scroll");
+        updateStatus();
+        handler.removeCallbacks(autoCycle);
+        handler.post(autoCycle);
+        toast("Auto-scroll: every 3 seconds. Trying Share -> Copy link.");
+    }
+    private void stopAuto() {
+        autoScroll = false;
+        handler.removeCallbacks(autoCycle);
+        if (autoButton != null) autoButton.setText("Start Auto (3s)");
+        updateStatus();
+    }
+
+    // Physical tap at a point in the WebView. Coordinates returned by JS are CSS pixels.
+    private void tapCssPosition(double cssX, double cssY, double cssW, double cssH) {
+        if (browser == null || cssW <= 0 || cssH <= 0 || browser.getWidth() <= 0) return;
+        float x = (float) (cssX * browser.getWidth() / cssW);
+        float y = (float) (cssY * browser.getHeight() / cssH);
+        final float fx = Math.max(1, Math.min(browser.getWidth()-1, x));
+        final float fy = Math.max(1, Math.min(browser.getHeight()-1, y));
+        final long down = SystemClock.uptimeMillis();
+        dispatchTouch(MotionEvent.ACTION_DOWN, fx, fy, down, down);
+        handler.postDelayed(() -> dispatchTouch(MotionEvent.ACTION_UP, fx, fy, down, SystemClock.uptimeMillis()), 75);
+    }
+    private void dispatchTouch(int action, float x, float y, long down, long when) {
+        if (browser == null) return;
+        MotionEvent e = MotionEvent.obtain(down, when, action, x, y, 0);
+        try { browser.dispatchTouchEvent(e); } finally { e.recycle(); }
+    }
+    private void swipeUpSlowly() {
+        if (browser == null || browser.getWidth() < 1 || browser.getHeight() < 150 || !browser.isShown()) return;
+        final float x = browser.getWidth() * .5f;
+        final float y0 = browser.getHeight() * .81f;
+        final float y1 = browser.getHeight() * .20f;
+        final long down = SystemClock.uptimeMillis();
+        dispatchTouch(MotionEvent.ACTION_DOWN, x, y0, down, down);
+        for (int i=1; i<=12; i++) {
+            final int index = i;
+            handler.postDelayed(() -> {
+                if (!autoScroll || !foreground || listVisible) return;
+                float y = y0 + (y1-y0)*index/12f;
+                dispatchTouch(index==12 ? MotionEvent.ACTION_UP : MotionEvent.ACTION_MOVE,
+                    x, y, down, SystemClock.uptimeMillis());
+            }, i*35L);
+        }
+    }
+
+    /**
+     * Finds the actual on-screen Share icon and the Copy link action in a native-looking
+     * Instagram web dialog. This does NOT spoof an Instagram permalink.
+     * If Instagram blocks the action or renders a native sheet, manual tapping is required.
+     */
+    private static final String FIND_SHARE = """
+        (function(){
+          try {
+            const W=innerWidth,H=innerHeight;
+            function visible(e){
+              if(!e)return null;
+              const r=e.getBoundingClientRect();
+              if(r.width<3||r.height<3||r.right<=0||r.bottom<=0||r.left>=W||r.top>=H)return null;
+              return {x:(r.left+r.right)/2,y:(r.top+r.bottom)/2};
+            }
+            function touchable(e){return e.closest('button,[role="button"],a') || e.parentElement || e;}
+            const all = document.querySelectorAll('svg[aria-label],button[aria-label],[role="button"][aria-label],svg title');
+            const options=[];
+            for (const e of all) {
+              const label=((e.getAttribute('aria-label')||e.textContent||'').trim());
+              if (!/^(share|share post|share reel|send post|share to|send)$/i.test(label)) continue;
+              const target=touchable(e.tagName.toLowerCase()==='title' ? e.parentElement : e);
+              const p=visible(target);
+              if(p)options.push({p,score:(p.x>W*.55?100:0)+p.y/H*20});
+            }
+            options.sort((a,b)=>b.score-a.score);
+            const p=options.length?options[0].p:null;
+            return JSON.stringify({found:!!p,x:p?p.x:0,y:p?p.y:0,w:W,h:H});
+          }catch(e){return JSON.stringify({found:false,error:'share-js-error'});}
+        })();
+        """;
+
+    private static final String FIND_COPY = """
+        (function(){
+          try{
+            const W=innerWidth,H=innerHeight;
+            function visible(e){
+              if(!e)return null;
+              const r=e.getBoundingClientRect();
+              if(r.width<3||r.height<3||r.right<=0||r.bottom<=0||r.left>=W||r.top>=H)return null;
+              return {x:(r.left+r.right)/2,y:(r.top+r.bottom)/2};
+            }
+            const all=document.querySelectorAll('button,[role="button"],[aria-label],span');
+            for(const e of all){
+              const label=(e.getAttribute('aria-label')||e.textContent||'').trim();
+              if(!/^(copy link|copy reel link|copy url|copy post link)$/i.test(label))continue;
+              const clickable=e.closest('button,[role="button"],a')||e.parentElement||e;
+              const p=visible(clickable);
+              if(p)return JSON.stringify({found:true,x:p.x,y:p.y,w:W,h:H});
+            }
+            return JSON.stringify({found:false});
+          }catch(e){return JSON.stringify({found:false,error:'copy-js-error'});}
+        })();
+        """;
+
+    private interface TapResult { void onResult(boolean success); }
+    private void tapWebElement(String js, TapResult callback) {
+        if (browser == null || listVisible || !foreground) { callback.onResult(false); return; }
+        browser.evaluateJavascript(js, raw -> {
             try {
-                // evaluateJavascript wraps the returned JSON string in another JSON string.
-                Object decoded = new org.json.JSONTokener(result).nextValue();
-                JSONObject obj = new JSONObject(String.valueOf(decoded));
-                String url = obj.optString("url", "");
-                String method = obj.optString("method", "unknown");
-                if (!url.isEmpty() && !"null".equals(url)) collect(url);
-                detection = method;
-                updateCount();
-            } catch(Exception ignored) { detection = "parse-error"; updateCount(); }
+                JSONObject obj = decodeJavascriptObject(raw);
+                if (!obj.optBoolean("found", false)) { callback.onResult(false); return; }
+                tapCssPosition(obj.getDouble("x"), obj.getDouble("y"), obj.getDouble("w"), obj.getDouble("h"));
+                callback.onResult(true);
+            } catch(Exception e) { callback.onResult(false); }
+        });
+    }
+    private JSONObject decodeJavascriptObject(String raw) throws Exception {
+        Object unwrapped = new JSONTokener(raw).nextValue();
+        return new JSONObject(String.valueOf(unwrapped));
+    }
+
+    private void attemptShareCopy() {
+        if (browser == null || !foreground || listVisible || shareBusy) return;
+        shareBusy = true;
+        sharePending = true;
+        clipboardBeforeAttempt = clipboardText();
+        shareStatus = "finding Share";
+        updateStatus();
+        tapWebElement(FIND_SHARE, didTapShare -> {
+            if (!didTapShare) {
+                shareBusy = false;
+                sharePending = false;
+                shareStatus = "Share button unavailable";
+                updateStatus();
+                return;
+            }
+            shareStatus = "Share tapped";
+            updateStatus();
+            handler.postDelayed(() -> tapWebElement(FIND_COPY, didTapCopy -> {
+                if (!didTapCopy) {
+                    shareBusy = false;
+                    shareStatus = "Tap Copy link manually";
+                    updateStatus();
+                    // Do not swipe behind an unknown share dialog and silently lose Reels.
+                    if (autoScroll) {
+                        stopAuto();
+                        toast("Share opened. Tap Copy link, then resume auto-scroll.");
+                    }
+                    return;
+                }
+                shareStatus = "Copy link tapped";
+                updateStatus();
+                handler.postDelayed(() -> {
+                    String current = clipboardText();
+                    if (!current.isEmpty() && !current.equals(clipboardBeforeAttempt)) collect(current);
+                    if (shareStatus.equals("Copy link tapped")) shareStatus = "Clipboard checked";
+                    shareBusy = false;
+                    sharePending = false;
+                    updateStatus();
+                }, 470);
+            }), 620);
         });
     }
 
-    private void collect(String url) {
-        if (url == null) return;
-        Matcher m = REEL_PATTERN.matcher(url);
-        if (m.find()) {
-            String clean = "https://www.instagram.com/reel/" + m.group(1) + "/";
-            if (links.add(clean)) { persist(); renderList(); }
+    // Clipboard collection is restricted to times when this app is foregrounded.
+    // It never saves unrelated clipboard text and does not ask for background access.
+    private String clipboardText() {
+        try {
+            if (clipboard == null || !clipboard.hasPrimaryClip()) return "";
+            ClipData data = clipboard.getPrimaryClip();
+            if (data == null || data.getItemCount() == 0) return "";
+            CharSequence value = data.getItemAt(0).coerceToText(this);
+            return value == null ? "" : value.toString();
+        } catch (Exception ignored) { return ""; }
+    }
+    private void captureClipboard() {
+        if (!foreground) return;
+        String text = clipboardText();
+        if (!text.isEmpty()) {
+            int before = links.size();
+            collect(text);
+            if (links.size() > before) {
+                shareStatus = "Link copied and SAVED";
+                sharePending = false;
+                updateStatus();
+                toast("Reel link saved: " + links.size());
+            }
         }
     }
-    private void persist() {
+
+    // DOM probe: only on-screen Reel links, avoiding unrelated off-screen suggestions.
+    private void probeVisibleReel() {
+        if (browser == null || !foreground || listVisible || probePending) return;
+        probePending = true;
+        String js = """
+            (function(){
+              try{
+                function clean(h){
+                  if(!h)return null;
+                  const u=new URL(h,location.href);
+                  if(!['instagram.com','www.instagram.com','m.instagram.com'].includes(u.hostname))return null;
+                  const parts=u.pathname.split('/').filter(Boolean);
+                  if(parts[0]==='reel' && parts[1])return 'https://www.instagram.com/reel/'+parts[1]+'/';
+                  if(parts[0]==='share'&&parts[1]==='reel'&&parts[2])
+                     return 'https://www.instagram.com/share/reel/'+parts[2]+'/';
+                  return null;
+                }
+                const loc=clean(location.href);
+                if(loc)return JSON.stringify({url:loc,method:'page-url'});
+                const W=innerWidth,H=innerHeight;
+                function visible(el){
+                  const r=el.getBoundingClientRect();
+                  const overlapX=Math.max(0,Math.min(r.right,W)-Math.max(r.left,0));
+                  const overlapY=Math.max(0,Math.min(r.bottom,H)-Math.max(r.top,0));
+                  return overlapX*overlapY;
+                }
+                const videos=Array.from(document.querySelectorAll('video'))
+                  .filter(v=>visible(v)>100)
+                  .sort((a,b)=>(b.paused?0:1)-(a.paused?0:1)||visible(b)-visible(a));
+                // Some Instagram variants place a canonical permalink in the video container.
+                if(videos.length){
+                  let n=videos[0];
+                  for(let depth=0;depth<10&&n;depth++,n=n.parentElement){
+                    if(n.tagName==='A'){
+                      const link=clean(n.href);if(link)return JSON.stringify({url:link,method:'video-anchor'});
+                    }
+                    const found=Array.from(n.querySelectorAll('a[href]'))
+                      .map(a=>clean(a.href)).filter(Boolean);
+                    const unique=Array.from(new Set(found));
+                    if(unique.length===1)return JSON.stringify({url:unique[0],method:'video-container'});
+                  }
+                }
+                const visibleLinks=Array.from(document.querySelectorAll('a[href]'))
+                  .map(a=>({link:clean(a.href),weight:visible(a)}))
+                  .filter(v=>v.link&&v.weight>10)
+                  .sort((a,b)=>b.weight-a.weight);
+                if(visibleLinks.length===1)return JSON.stringify({url:visibleLinks[0].link,method:'visible-anchor'});
+                return JSON.stringify({url:null,method:videos.length?'no-permalink':'no-video'});
+              }catch(e){return JSON.stringify({url:null,method:'js-error'});}
+            })();
+            """;
+        browser.evaluateJavascript(js, raw -> {
+            probePending = false;
+            try {
+                JSONObject obj = decodeJavascriptObject(raw);
+                String url = obj.optString("url", "");
+                detectStatus = obj.optString("method", "unknown");
+                if (url != null && !url.equals("null") && !url.isEmpty()) collect(url);
+            } catch(Exception ignored) { detectStatus = "parse-error"; }
+            updateStatus();
+        });
+    }
+
+    private void collect(String text) {
+        if (text == null) return;
+        Matcher matcher = REEL_LINK.matcher(text);
+        boolean changed = false;
+        while (matcher.find()) {
+            String kind = matcher.group(1).toLowerCase(Locale.ROOT);
+            String id = matcher.group(2);
+            String clean = "https://www.instagram.com/" + kind + "/" + id + "/";
+            if (links.add(clean)) changed = true;
+        }
+        if (changed) { saveLinks(); renderList(); }
+    }
+    private void saveLinks() {
         getPreferences(MODE_PRIVATE).edit().putStringSet("reels", new HashSet<>(links)).apply();
-        updateCount();
+        updateStatus();
     }
     private List<String> sortedLinks() {
-        List<String> items = new ArrayList<>(links);
-        Collections.sort(items);
-        return items;
+        List<String> result = new ArrayList<>(links);
+        Collections.sort(result);
+        return result;
     }
     private String allLinks() { return android.text.TextUtils.join("\n", sortedLinks()); }
     private void renderList() {
         if (savedList == null) return;
         savedList.removeAllViews();
         for (String link : sortedLinks()) {
-            TextView item = new TextView(this);
-            item.setText(link);
-            item.setTextSize(14);
-            item.setPadding(0, 8, 0, 8);
-            item.setTextIsSelectable(true);
-            item.setOnClickListener(v -> {
-                ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Reel", link));
-                Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show();
+            TextView t = new TextView(this);
+            t.setText(link);
+            t.setTextSize(14);
+            t.setPadding(0, 9, 0, 9);
+            t.setTextIsSelectable(true);
+            t.setOnClickListener(v -> {
+                clipboard.setPrimaryClip(ClipData.newPlainText("Reel link", link));
+                toast("Link copied");
             });
-            savedList.addView(item);
+            savedList.addView(t);
         }
-        updateCount();
+        updateStatus();
     }
     private void showList() {
-        stopAutoScroll();
+        stopAuto();
         listVisible = true;
         browser.setVisibility(View.GONE);
         listScroll.setVisibility(View.VISIBLE);
     }
     private void showBrowser() {
         listVisible = false;
-        browser.setVisibility(View.VISIBLE);
-        listScroll.setVisibility(View.GONE);
+        if (browser != null) browser.setVisibility(View.VISIBLE);
+        if (listScroll != null) listScroll.setVisibility(View.GONE);
+    }
+    private void pasteLink() {
+        int before = links.size();
+        collect(clipboardText());
+        toast(links.size() > before ? "Copied Reel link saved" : "No new Reel URL on clipboard");
     }
     private void copyAll() {
-        if (links.isEmpty()) { Toast.makeText(this, "No links saved", Toast.LENGTH_SHORT).show(); return; }
-        ((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Reel Links", allLinks()));
-        Toast.makeText(this, "All links copied", Toast.LENGTH_SHORT).show();
+        if (links.isEmpty()) { toast("No links saved yet"); return; }
+        clipboard.setPrimaryClip(ClipData.newPlainText("Reel links", allLinks()));
+        toast("All links copied");
     }
     private void exportTxt() {
-        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("text/plain");
-        intent.putExtra(Intent.EXTRA_TITLE, "instagram_reel_links.txt");
-        startActivityForResult(intent, EXPORT_REQUEST);
+        if (links.isEmpty()) { toast("No links saved yet"); return; }
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("text/plain");
+        i.putExtra(Intent.EXTRA_TITLE, "instagram_reel_links.txt");
+        startActivityForResult(i, EXPORT_REQUEST);
     }
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
         if (request == EXPORT_REQUEST && result == RESULT_OK && data != null && data.getData() != null) {
             try (OutputStream out = getContentResolver().openOutputStream(data.getData())) {
-                if (out == null) throw new Exception("Output unavailable");
+                if (out == null) throw new Exception("Cannot open output");
                 out.write(allLinks().getBytes(StandardCharsets.UTF_8));
-                Toast.makeText(this, "TXT exported", Toast.LENGTH_SHORT).show();
-            } catch (Exception e) { Toast.makeText(this, "Export error: " + e.getMessage(), Toast.LENGTH_LONG).show(); }
+                toast("TXT file saved");
+            } catch(Exception ex) { toast("Export failed: " + ex.getMessage()); }
         }
     }
-    @Override protected void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-        setIntent(intent);
-        handleSharedText(intent);
-    }
-    private void handleSharedText(Intent intent) {
-        if (Intent.ACTION_SEND.equals(intent.getAction()) && "text/plain".equals(intent.getType())) {
+    private void receiveSharedText(Intent i) {
+        if (i != null && Intent.ACTION_SEND.equals(i.getAction()) && "text/plain".equals(i.getType())) {
             int before = links.size();
-            collect(intent.getStringExtra(Intent.EXTRA_TEXT));
-            Toast.makeText(this, links.size() > before ? "Shared Reel saved" : "No new Reel URL in share", Toast.LENGTH_SHORT).show();
+            collect(i.getStringExtra(Intent.EXTRA_TEXT));
+            toast(links.size() > before ? "Shared Reel saved" : "No Reel link in shared text");
         }
+    }
+    @Override protected void onNewIntent(Intent i) {
+        super.onNewIntent(i);
+        setIntent(i);
+        receiveSharedText(i);
     }
     @Override public void onBackPressed() {
         if (listVisible) showBrowser();
-        else if (browser.canGoBack()) browser.goBack();
+        else if (browser != null && browser.canGoBack()) browser.goBack();
         else super.onBackPressed();
     }
     @Override protected void onPause() {
         foreground = false;
-        stopAutoScroll(); // never scroll in the background
+        stopAuto();
         super.onPause();
     }
     @Override protected void onResume() {
         super.onResume();
         foreground = true;
+        if (sharePending) handler.postDelayed(() -> {
+            String current = clipboardText();
+            if (!current.equals(clipboardBeforeAttempt)) captureClipboard();
+        }, 350);
     }
     @Override protected void onDestroy() {
-        handler.removeCallbacks(scrollTask);
-        handler.removeCallbacks(watcher);
+        handler.removeCallbacks(periodicProbe);
+        handler.removeCallbacks(autoCycle);
+        if (clipboard != null && clipListener != null) clipboard.removePrimaryClipChangedListener(clipListener);
         if (browser != null) browser.destroy();
         super.onDestroy();
     }
