@@ -7,13 +7,13 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    name: Build Debug APK
+    name: Build Instagram Collector APK
     runs-on: ubuntu-latest
-
-    permissions:
-      contents: read
 
     steps:
       - name: Checkout Repository
@@ -25,21 +25,18 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Gradle 8.7
+      - name: Setup Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.7'
+          gradle-version: '8.9'
 
       - name: Configure Android SDK
         shell: bash
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
-
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 
           if [ ! -x "$SDKMANAGER" ]; then
-            echo "Android SDK Manager not found"
+            echo "Android SDK Manager missing"
             exit 1
           fi
 
@@ -52,37 +49,33 @@ jobs:
             "platforms;android-35" \
             "build-tools;35.0.0"
 
-      - name: Show Build Environment
+      - name: Verify Versions
         run: |
           java -version
           gradle --version
-          ls -la
-          cat build.gradle
-          cat settings.gradle
-          cat app/build.gradle
 
       - name: Build Debug APK
         shell: bash
         run: |
+          set -o pipefail
           gradle assembleDebug \
             --no-daemon \
             --stacktrace \
-            --warning-mode all \
             2>&1 | tee build-log.txt
 
       - name: Upload Build Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Gradle-Build-Logs
+          name: Build-Logs
           path: build-log.txt
           if-no-files-found: ignore
 
-      - name: Upload Android APK
+      - name: Upload APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Instagram-Reel-Collector-v2-APK
+          name: Instagram-Collector-AutoScroll-APK
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 30
