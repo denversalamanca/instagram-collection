@@ -1,20 +1,26 @@
-# Instagram Reel Collector v6 — stable pacing
+# Instagram Reel Collector v7 — Auto-Retry after 3 seconds
 
-Android Java WebView project (minSdk 23, suitable for Redmi 9A on Android 10).
+This version modifies the v6 Android Java WebView app.
 
-## Automatic cycle
-1. Tap Share.
-2. Wait **1 second**, then tap Copy Link.
-3. Wait **1 second** for clipboard, then attempt to dismiss Share.
-4. Wait **1 second** for dismiss verification.
-5. Wait **2 seconds**, then swipe to next Reel.
-6. Wait **2 seconds** for the next Reel before the next Share attempt.
+## What is fixed
 
-A single sequential cycle is used. DOM link probes are disabled during Auto mode and reduced to once every four seconds when idle, to reduce WebView load on low-memory devices. A WebView renderer failure is handled by recreating the activity instead of allowing the process to crash, when Android reports it. This is best-effort and does not guarantee recovery from every crash.
+- **Copy link not found** and other recoverable Share/Copy failures no longer immediately leave Auto OFF.
+- The app displays **Auto: RETRY in 3s**, attempts to dismiss a leftover HTML Share dialog, and programmatically resumes its own Auto Mode after 3 seconds.
+- Maximum **3 consecutive retries**; after that it stops and asks for manual Share > Copy link. No infinite rapid restart loop.
+- **Stop** / **Cancel Retry** cancels queued restarts immediately.
+- After a valid copied Reel link is detected, the retry counter resets.
+- Existing Share → wait 1s → Copy → wait 1s → close → wait 2s → swipe → wait 2s workflow is retained.
+- Saved links remain locally stored and can be exported as TXT.
+- Minimum Android API 23 (Android 6), targeting Redmi 9A Android 10 compatibility.
 
-**Caveat:** Instagram may use a native share sheet or block scripted UI interactions, so not every share/copy operation or reel URL is guaranteed. An app cannot guarantee that a 1–3 second delay avoids Instagram automation checks.
+## Important limitations
 
-## GitHub
-Upload/replace the files in the same paths of `denversalamanca/instagram-collection`. Commit changes and open Actions → Build Android APK. Download the APK artifact if the build succeeds. The source has not been compiled or tested on a phone in this environment.
+Screenshot showing `Auto: OFF` with `Copy link not found` is evidence of an intentional stop on an in-app failure, **not proof of an Android process crash**.
 
-If the app crashes again, capture Android Logcat or a `adb logcat -d -b crash` report to identify the root cause.
+This 3-second recovery works ONLY while the app's Activity/process remains alive, visible and WebView responds. After a true fatal app/process crash, no in-process handler can press Start; Android limits background activity launches. A separate logcat trace is needed to debug genuine crashes. If Instagram hides its Copy link control, it may still require manual interaction.
+
+There is no guarantee that 3-second spacing avoids platform rate limits or policy restrictions. Never manufacture Reel URLs; this app saves only actual detected/copied Reel permalinks. Do not use the app for collection that violates platform rules.
+
+## GitHub Actions build
+
+Upload the **contents** of this folder to the GitHub repository root, overwriting old files (do not nest inside an extra `InstagramReelCollector_v7_...` directory). Include `.github/workflows/build-apk.yml`. Commit and open Actions → Build Android APK. On success download artifact `InstagramReelCollector-v7-AutoRetry-APK`. This project is source only, not a verified compiled APK.

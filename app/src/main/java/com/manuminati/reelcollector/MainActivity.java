@@ -41,7 +41,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Reel Collector v6: only saves real Instagram Reel links.
+ * Reel Collector v7: only saves real Instagram Reel links.
  * Automatic Share -> Copy link uses visible web controls, not private APIs.
  * Instagram may reject scripted / synthetic interaction. If so, manually
  * tapping Share -> Copy link while the app is open still collects via clipboard.
@@ -54,6 +54,10 @@ public class MainActivity extends Activity {
     private static final long AFTER_CLOSE_DELAY = 2000L;
     private static final long AFTER_SWIPE_DELAY = 2000L;
     private static final long DISMISS_VERIFY_DELAY = 1000L;
+    // Recoverable UI errors: retry the Start Auto cycle after 3 seconds.
+    // Hard-stop after 3 failures rather than repeatedly sending actions forever.
+    private static final long AUTO_RETRY_DELAY = 3000L;
+    private static final int MAX_AUTO_RETRIES = 3;
     private static final Pattern REEL_LINK = Pattern.compile(
         "https?://(?:(?:www|m)\\.)?instagram\\.com/(reel|share/reel)/([A-Za-z0-9_-]+)",
         Pattern.CASE_INSENSITIVE);
@@ -70,6 +74,10 @@ public class MainActivity extends Activity {
     private boolean foreground = true;
     private boolean listVisible = false;
     private boolean autoScroll = false;
+    // Remains true during the 3-second recovery countdown; unlike autoScroll.
+    private boolean autoRequested = false;
+    private int autoRetryCount = 0;
+    private Runnable pendingAutoRetry;
     private boolean probePending = false;
     private boolean shareBusy = false;
     private int cycleToken = 0;
@@ -238,29 +246,99 @@ public class MainActivity extends Activity {
     private void toast(String message) { Toast.makeText(this, message, Toast.LENGTH_SHORT).show(); }
     private void updateStatus() {
         if (status != null) status.setText("Saved: " + links.size() +
-            " | Auto: " + (autoScroll ? "ON / sequential" : "OFF") +
+            " | Auto: " + (autoScroll ? "ON / sequential" : (autoRequested ? "RETRY in 3s" : "OFF")) +
             "\nDetect: " + detectStatus + " | Share: " + shareStatus);
     }
 
     private void toggleAuto() {
-        if (autoScroll) { stopAuto(); return; }
+        if (autoRequested) { stopAuto(); return; }
         showBrowser();
+        autoRequested = true;
+        autoRetryCount = 0;
         cycleToken++;
         autoScroll = true;
         autoButton.setText("Pause Auto Scroll");
         updateStatus();
         handler.removeCallbacks(autoCycle);
         handler.post(autoCycle);
-        toast("Auto: Share > 1s > Copy > 1s > Back > 2s > Swipe > 2s.");
+        toast("Auto started. If Copy link fails, retry after 3 seconds (max 3).");
     }
     private void stopAuto() {
+        autoRequested = false;
         autoScroll = false;
         cycleToken++;
         handler.removeCallbacks(autoCycle);
+        if (pendingAutoRetry != null) {
+            handler.removeCallbacks(pendingAutoRetry);
+            pendingAutoRetry = null;
+        }
         shareBusy = false;
         sharePending = false;
         if (autoButton != null) autoButton.setText("Start Auto");
         updateStatus();
+    }
+
+    /**
+     * A failed Share/Copy lookup is an in-app stop, not necessarily an app crash.
+     * Resume the workflow after 3 seconds only while this Activity is alive,
+     * visible, and the user has not pressed Stop. Do not silently skip Reels.
+     */
+    private void autoRetryInThreeSeconds(String reason) {
+        shareBusy = false;
+        sharePending = false;
+        if (!autoRequested || !foreground || browser == null || listVisible) {
+            shareStatus = reason;
+            updateStatus();
+            return;
+        }
+        autoScroll = false;
+        cycleToken++;
+        handler.removeCallbacks(autoCycle);
+        if (pendingAutoRetry != null) handler.removeCallbacks(pendingAutoRetry);
+        if (autoRetryCount >= MAX_AUTO_RETRIES) {
+            autoRequested = false;
+            shareStatus = reason + " | 3 retries failed; tap Copy manually";
+            if (autoButton != null) autoButton.setText("Start Auto");
+            updateStatus();
+            toast("Auto paused after 3 failed retries. Try Share > Copy link manually.");
+            return;
+        }
+        autoRetryCount++;
+        final int token = cycleToken;
+        shareStatus = reason + " | retry " + autoRetryCount + "/3 in 3s";
+        if (autoButton != null) autoButton.setText("Cancel Retry");
+        updateStatus();
+        pendingAutoRetry = () -> {
+            pendingAutoRetry = null;
+            if (token != cycleToken || !autoRequested || !foreground || listVisible || browser == null) return;
+            // Clean up a possible leftover Share dialog before retrying Start Auto.
+            final WebView active = browser;
+            active.evaluateJavascript(DISMISS_SHARE, ignored -> {
+                if (token != cycleToken || !autoRequested || !foreground || browser != active) return;
+                handler.postDelayed(() -> {
+                    if (token != cycleToken || !autoRequested || !foreground || browser != active) return;
+                    active.evaluateJavascript("(function(){return !!document.querySelector('[role=\"dialog\"],dialog[open]')})()", value -> {
+                        if (token != cycleToken || !autoRequested || !foreground || browser != active) return;
+                        if ("true".equals(value)) {
+                            // We must not swipe while Instagram's Share overlay is open.
+                            autoRequested = false;
+                            autoScroll = false;
+                            shareStatus = "Share still open; close manually, then Start Auto";
+                            if (autoButton != null) autoButton.setText("Start Auto");
+                            updateStatus();
+                            toast("Share is still open. Close it manually and press Start Auto.");
+                            return;
+                        }
+                        autoScroll = true;
+                        shareStatus = "Auto restarted after 3s; finding Share";
+                        if (autoButton != null) autoButton.setText("Pause Auto Scroll");
+                        updateStatus();
+                        handler.post(autoCycle);
+                    });
+                }, 450L);
+            });
+        };
+        handler.postDelayed(pendingAutoRetry, AUTO_RETRY_DELAY);
     }
 
     // Physical tap at a point in the WebView. Coordinates returned by JS are CSS pixels.
@@ -420,8 +498,8 @@ public class MainActivity extends Activity {
                         shareStatus = "Share still open: close manually";
                         shareBusy = false;
                         sharePending = false;
-                        if (automatic) stopAuto();
-                        updateStatus();
+                        if (automatic) autoRetryInThreeSeconds("Share still open");
+                        else updateStatus();
                         return;
                     }
                     shareStatus = "Share closed; waiting 2s";
@@ -448,8 +526,8 @@ public class MainActivity extends Activity {
                 shareBusy = false;
                 sharePending = false;
                 shareStatus = "Share button unavailable";
-                if (automatic) stopAuto();
-                updateStatus();
+                if (automatic) autoRetryInThreeSeconds("Share button unavailable");
+                else updateStatus();
                 return;
             }
             shareStatus = "Share tapped";
@@ -458,10 +536,12 @@ public class MainActivity extends Activity {
                 if (automatic && token != cycleToken) return;
                 if (!didTapCopy) {
                     shareBusy = false;
-                    shareStatus = "Tap Copy link manually";
-                    if (automatic) stopAuto();
-                    updateStatus();
-                    toast("Copy link not found; tap it manually, then close Share.");
+                    shareStatus = "Copy link not found";
+                    if (automatic) autoRetryInThreeSeconds("Copy link not found");
+                    else {
+                        updateStatus();
+                        toast("Copy link not found; tap it manually, then close Share.");
+                    }
                     return;
                 }
                 shareStatus = "Copy link tapped";
@@ -473,12 +553,14 @@ public class MainActivity extends Activity {
                     // The clipboard may be unavailable, or Instagram may have blocked copying.
                     // Never advance automatically unless we have a valid Reel permalink.
                     if (current.isEmpty() || !REEL_LINK.matcher(current).find()) {
-                        shareStatus = "No copied URL; check Share manually";
+                        shareStatus = "No copied Reel URL";
                         shareBusy = false;
-                        if (automatic) stopAuto();
-                        updateStatus();
+                        if (automatic) autoRetryInThreeSeconds("No copied Reel URL");
+                        else updateStatus();
                         return;
                     }
+                    // A valid copied link means this cycle succeeded; reset the retry budget.
+                    autoRetryCount = 0;
                     closeShareThenContinue(token, automatic);
                 }, AFTER_COPY_DELAY);
             }), AFTER_SHARE_DELAY);
@@ -504,6 +586,7 @@ public class MainActivity extends Activity {
             collect(text);
             if (links.size() > before) {
                 shareStatus = "Link copied and SAVED";
+                autoRetryCount = 0;
                 sharePending = false;
                 updateStatus();
                 toast("Reel link saved: " + links.size());
